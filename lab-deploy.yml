@@ -1,0 +1,119 @@
+- name: Deploy *secure* web application in Docker container
+  hosts: localhost
+  connection: local
+  become: yes
+
+  vars:
+    app_user: "appadmin"
+    download_url: "https://github.com/octocat/Hello-World/tarball/master"
+    download_sha256: "9c1185a5c5e9fc54612808977ee8f548b2258d31a"   # fix: checksum (пример checksum)
+    work_dir: "/opt/webapp"
+    container_name: "secure-app"
+    image_version: "1.28.0-alpine"   # fix: актуальный nginx stable
+    allowed_ports: [22, 8080]
+
+  # fix: выносим любой секрет во внешний vault-файл
+  vars_files:
+    - vault.yml       # содержит `app_password: "<hashed-or-plain>"`
+
+  collections:
+    - community.docker
+    - community.general
+
+  tasks:
+  - name: Update apt cache
+    ansible.builtin.apt:
+      update_cache: yes
+    tags: packages
+
+  - name: Install Docker & ufw
+    ansible.builtin.apt:
+      name:
+        - docker.io
+        - ufw
+      state: present
+    tags: packages
+
+  - name: Ensure Docker service is running
+    ansible.builtin.service:
+      name: docker
+      state: started
+      enabled: yes
+    tags: docker
+
+  - name: Create application user without login shell
+    ansible.builtin.user:
+      name: "{{ app_user }}"
+      password: "{{ app_password | password_hash('sha512') }}"
+      shell: /usr/sbin/nologin
+      update_password: on_create
+    tags: users
+
+  - name: Enable UFW and allow only SSH + web
+    community.general.ufw:
+      state: enabled
+      rule: allow
+      port: "{{ item }}"
+    loop: "{{ allowed_ports }}"
+    tags: network
+
+  - name: Download application archive WITH checksum          # fix
+    ansible.builtin.get_url:
+      url: "{{ download_url }}"
+      dest: "/tmp/app.tar.gz"
+      checksum: "sha256:{{ download_sha256 }}"
+
+  - name: Ensure working directory exists
+    ansible.builtin.file:
+      path: "{{ work_dir }}"
+      state: directory
+      owner: "{{ app_user }}"
+      group: "{{ app_user }}"
+      mode: '0750'                       # fix: 0750 вместо 0777
+    tags: deploy
+
+  - name: Extract application archive (idempotent)
+    ansible.builtin.unarchive:
+      src: "/tmp/app.tar.gz"
+      dest: "{{ work_dir }}"
+      owner: "{{ app_user }}"
+      group: "{{ app_user }}"
+      remote_src: yes
+      creates: "{{ work_dir }}/index.html"
+    tags: deploy
+
+  # WHY: генерируем токен, но НЕ кладём его статически в HTML -- это демо;
+  #      в реальном проекте хранить в Vault и отдавать через API.
+  - name: Generate one-time secret token (demo)
+    ansible.builtin.command: "openssl rand -hex 16"
+    register: secret_token
+    changed_when: false
+    tags: token
+
+  - name: Deploy index.html without hard-coded token           # fix
+    ansible.builtin.template:
+      src: index.html.j2
+      dest: "{{ work_dir }}/index.html"
+      owner: "{{ app_user }}"
+      group: "{{ app_user }}"
+      mode: '0644'
+    tags: web
+
+  - name: Run secure Nginx container as unprivileged user      # fix
+    community.docker.docker_container:
+      name: "{{ container_name }}"
+      image: "nginx:{{ image_version }}"
+      user: "{{ app_user }}"              # не-root внутри контейнера
+      state: started
+      restart_policy: unless-stopped
+      ports:
+        - "8080:80"
+      volumes:
+        - "{{ work_dir }}:/usr/share/nginx/html:ro"
+    tags: docker
+
+  - name: Remove passwordless sudo for app user                # fix
+    ansible.builtin.file:
+      path: "/etc/sudoers.d/{{ app_user }}"
+      state: absent
+    tags: sudoers
